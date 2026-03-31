@@ -73,21 +73,56 @@ def upload_data():
         )
 
         # Step 4: Upload to Pinecone
+        @app.route("/upload", methods=["POST"])
+def upload_data():
+    try:
+        raw_text = request.form.get("text")
+        file = request.files.get("file")
+
+        raw_docs = []
+
+        if file and file.filename != "":
+            filename = secure_filename(file.filename)
+            filepath = os.path.join(UPLOAD_FOLDER, filename)
+            file.save(filepath)
+
+            loader = PyPDFLoader(filepath)
+            raw_docs = loader.load()
+
+        elif raw_text and raw_text.strip():
+            raw_docs = [Document(page_content=raw_text)]
+
+        else:
+            return jsonify({"error": "No file or text provided"}), 400
+
+        # Split
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=150
+        )
+        chunked_docs = text_splitter.split_documents(raw_docs)
+
+        # Embeddings
+        embeddings = GoogleGenerativeAIEmbeddings(
+            model="models/text-embedding-004",
+            google_api_key=os.getenv("GEMINI_API_KEY")
+        )
+
+        # Pinecone
         pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
         index_name = os.getenv("PINECONE_INDEX_NAME")
-
         index = pc.Index(index_name)
 
-vectors = []
-for i, doc in enumerate(chunked_docs):
-    vector = embeddings.embed_query(doc.page_content)
-    vectors.append({
-        "id": str(i),
-        "values": vector,
-        "metadata": {"text": doc.page_content}
-    })
+        vectors = []
+        for i, doc in enumerate(chunked_docs):
+            vector = embeddings.embed_query(doc.page_content)
+            vectors.append({
+                "id": str(i),
+                "values": vector,
+                "metadata": {"text": doc.page_content}
+            })
 
-index.upsert(vectors=vectors)
+        index.upsert(vectors=vectors)
 
         return jsonify({"message": "✅ Data uploaded and stored in Pinecone!"})
 

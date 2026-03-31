@@ -1,0 +1,11 @@
+services:
+  - type: web
+    runtime: python
+    pythonVersion: "3.11.9"   # add this line
+```
+
+**2. Check your `pyproject.toml` or `setup.cfg`** — if either exists, remove or update the Python version constraint there.
+
+**3. Most reliable fix — add a `runtime.txt`** in your project root:
+```
+python-3.11.9

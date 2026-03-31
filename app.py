@@ -6,15 +6,11 @@ from pinecone import Pinecone
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import google.generativeai as genai
 from werkzeug.utils import secure_filename
-from langchain_pinecone import PineconeVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
 import cohere
 
-
-
-start = time.time()
 # Load environment variables
 load_dotenv()
 
@@ -30,50 +26,14 @@ app = Flask(__name__)
 # Chat history (in memory)
 History = []
 
-# -------------------------------------------------------------File or text Uploader --------------------------------------------------
-
+# Upload folder
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+
+# ------------------------------------------------------------------ Upload Route ------------------------------------------------------------------
+
 @app.route("/upload", methods=["POST"])
-def upload_data():
-    try:
-        raw_text = request.form.get("text")  # text sent via form-data
-        file = request.files.get("file")     # file sent via form-data
-
-        raw_docs = []
-
-        # Case 1: PDF upload
-        if file and file.filename != "":
-            filename = secure_filename(file.filename)
-            filepath = os.path.join(UPLOAD_FOLDER, filename)
-            file.save(filepath)
-
-            loader = PyPDFLoader(filepath)
-            raw_docs = loader.load()
-
-        # Case 2: Raw text upload
-        elif raw_text and raw_text.strip():
-            raw_docs = [Document(page_content=raw_text)]
-
-        else:
-            return jsonify({"error": "No file or text provided"}), 400
-
-        # Step 2: Split into chunks
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=150
-        )
-        chunked_docs = text_splitter.split_documents(raw_docs)
-
-        # Step 3: Create embeddings
-        embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004",
-            google_api_key=os.getenv("GEMINI_API_KEY")
-        )
-
-        # Step 4: Upload to Pinecone
-        @app.route("/upload", methods=["POST"])
 def upload_data():
     try:
         raw_text = request.form.get("text")
@@ -85,7 +45,6 @@ def upload_data():
             filename = secure_filename(file.filename)
             filepath = os.path.join(UPLOAD_FOLDER, filename)
             file.save(filepath)
-
             loader = PyPDFLoader(filepath)
             raw_docs = loader.load()
 
@@ -95,20 +54,20 @@ def upload_data():
         else:
             return jsonify({"error": "No file or text provided"}), 400
 
-        # Split
+        # Split into chunks
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=150
         )
         chunked_docs = text_splitter.split_documents(raw_docs)
 
-        # Embeddings
+        # Create embeddings
         embeddings = GoogleGenerativeAIEmbeddings(
             model="models/text-embedding-004",
             google_api_key=os.getenv("GEMINI_API_KEY")
         )
 
-        # Pinecone
+        # Upload to Pinecone
         pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
         index_name = os.getenv("PINECONE_INDEX_NAME")
         index = pc.Index(index_name)
@@ -130,13 +89,10 @@ def upload_data():
         return jsonify({"error": str(e)}), 500
 
 
+# ------------------------------------------------------------------ Query Rewriting ------------------------------------------------------------------
 
-
-
-
-# ---------------------------------------------------------Transfrom Query -------------------------------------------------------
-def transform_query(question: str) -> str:
-    """Rewrite follow-up question into standalone query"""
+def transform_query(question: str) -> tuple[str, float]:
+    """Rewrite a follow-up question into a standalone query."""
     History.append({"role": "user", "parts": [{"text": question}]})
 
     model = genai.GenerativeModel(
@@ -147,16 +103,19 @@ def transform_query(question: str) -> str:
         Only output the rewritten question and nothing else."""
     )
 
+    t0 = time.time()
     response = model.generate_content(History)
-    History.pop()           # Remove the transform_query to avoid confusion in future interactions
+    elapsed = time.time() - t0
 
-    elapsed = time.time() - start
-    return response.text, elapsed
+    History.pop()  # Remove so it doesn't pollute future turns
 
-# ------------------------------------------------------ get context from pinecone vector database----------------------------------------------------------
+    return response.text.strip(), elapsed
+
+
+# ------------------------------------------------------------------ Retrieval + Reranking ------------------------------------------------------------------
 
 def get_context(query: str) -> str:
-    """Retrieve top documents from Pinecone as context"""
+    """Retrieve and rerank top documents from Pinecone."""
     embeddings = GoogleGenerativeAIEmbeddings(
         model="models/text-embedding-004",
         google_api_key=os.getenv("GEMINI_API_KEY")
@@ -167,40 +126,43 @@ def get_context(query: str) -> str:
     index_name = os.getenv("PINECONE_INDEX_NAME")
     pinecone_index = pc.Index(index_name)
 
-    # Step 1: Retrieve from Pinecone
+    # Retrieve from Pinecone
     search_results = pinecone_index.query(
         vector=query_vector,
-        top_k=5,
+        top_k=10,
         include_metadata=True
     )
 
-    documents = [match['metadata']['text'] for match in search_results['matches']]
+    documents = [match["metadata"]["text"] for match in search_results["matches"]]
 
-    # Step 2: Rerank with Cohere
+    if not documents:
+        return ""
+
+    # Rerank with Cohere
     rerank_results = cohere_client.rerank(
         model="rerank-english-v3.0",
         query=query,
         documents=documents,
-        top_n=5  # final top docs
+        top_n=5
     )
 
-    # Step 3: Build context string
     reranked_docs = [documents[r.index] for r in rerank_results.results]
     context = "\n\n---\n\n".join(reranked_docs)
 
     return context
 
 
-# ----------------------------------------------------------chat_with_gemini ----------------------------------------------------------
-def chat_with_gemini(query: str, context: str) -> str:
-    """Generate answer using Gemini with context"""
+# ------------------------------------------------------------------ Generation ------------------------------------------------------------------
+
+def chat_with_gemini(query: str, context: str) -> tuple[str, float, int]:
+    """Generate an answer using Gemini with retrieved context."""
     History.append({"role": "user", "parts": [{"text": query}]})
 
     model = genai.GenerativeModel(
         "gemini-2.5-flash",
         system_instruction=f"""You will be given a context of relevant information and a user question.
         Your task is to answer the user's question based ONLY on the provided context.
-        If the answer is not in the context, you must say:
+        If the answer is not in the context, say:
         "I could not find the answer in the provided document."
         Keep your answers clear, concise, and educational.
 
@@ -208,17 +170,18 @@ def chat_with_gemini(query: str, context: str) -> str:
         """
     )
 
+    t0 = time.time()
     response = model.generate_content(History)
+    elapsed = time.time() - t0
 
     History.append({"role": "model", "parts": [{"text": response.text}]})
-    elapsed = time.time() - start
 
     tokens_used = len(query.split()) + len(context.split())
-    return response.text, context, elapsed, tokens_used
+    return response.text, elapsed, tokens_used
 
 
+# ------------------------------------------------------------------ Flask Routes ------------------------------------------------------------------
 
-# ----------------------------------------------------------------Flask Routes ------------------------------------------------------------
 @app.route("/")
 def home():
     return render_template("index.html")
@@ -228,33 +191,38 @@ def home():
 def ask_question():
     data = request.get_json(force=True)
     question = data.get("question") or data.get("query") or ""
-    
+
     if not question:
         return jsonify({"error": "No question provided"}), 400
 
     rewritten_query, rewrite_time = transform_query(question)
     context = get_context(rewritten_query)
-    answer, context, runtime, tokens = chat_with_gemini(rewritten_query, context)
+
+    if not context:
+        return jsonify({
+            "question": question,
+            "rewritten_query": rewritten_query,
+            "answer": "I could not find the answer in the provided document.",
+            "sources": [],
+            "runtime": round(rewrite_time, 2),
+            "tokens": 0
+        })
+
+    answer, gen_time, tokens = chat_with_gemini(rewritten_query, context)
     sources = context.split("\n\n---\n\n")
+
     return jsonify({
         "question": question,
         "rewritten_query": rewritten_query,
         "answer": answer,
-        "sources" : sources[1:3],
-        "runtime": round(runtime + rewrite_time, 2),
+        "sources": sources[1:3],
+        "runtime": round(rewrite_time + gen_time, 2),
         "tokens": tokens
     })
 
 
+# ------------------------------------------------------------------ Entry Point ------------------------------------------------------------------
 
-# ---------- Run Flask ----------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))  # Render gives a PORT env var
-    app.run(host="0.0.0.0", port=port)  
-
-
-
-
-
-
-
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)

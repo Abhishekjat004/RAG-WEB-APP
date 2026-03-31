@@ -76,11 +76,18 @@ def upload_data():
         pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
         index_name = os.getenv("PINECONE_INDEX_NAME")
 
-        vector_store = PineconeVectorStore.from_documents(
-            documents=chunked_docs,
-            embedding=embeddings,
-            index_name=index_name
-        )
+        index = pc.Index(index_name)
+
+vectors = []
+for i, doc in enumerate(chunked_docs):
+    vector = embeddings.embed_query(doc.page_content)
+    vectors.append({
+        "id": str(i),
+        "values": vector,
+        "metadata": {"text": doc.page_content}
+    })
+
+index.upsert(vectors=vectors)
 
         return jsonify({"message": "✅ Data uploaded and stored in Pinecone!"})
 
